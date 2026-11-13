@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Entry is one known secret and the stand-in the model sees instead of it.
@@ -30,8 +32,9 @@ type Vault struct {
 	byValue, byToken map[string]*Entry
 	mask, unmaskJSON *strings.Replacer
 
-	renames              map[string]string // real name -> name the agent sees, and the reverse
-	unrenames            map[string]string
+	hosts                []hostMask        // [hosts], longest name first
+	renames              map[string]rename // lowercased real word -> rule, and the reverse
+	unrenames            map[string]rename
 	renameRe, unrenameRe *regexp.Regexp
 }
 
@@ -101,18 +104,44 @@ func (v *Vault) Entries() []Entry {
 	return out
 }
 
+// Rewrite is one kind of substitution in a body, as the traffic view reports it.
+type Rewrite struct {
+	Kind   string `json:"kind"`  // "secret", "rename" or "host"
+	Name   string `json:"name"`  // the secret's name, the [names] word, or the [hosts] target
+	Real   string `json:"real"`  // what the agent has
+	Shown  string `json:"shown"` // what the model sees
+	Source string `json:"source,omitempty"`
+	Count  int    `json:"count"`
+}
+
 // Mask replaces secrets in a raw JSON body. It works on the escaped bytes so key
 // order and formatting are untouched. It refuses to return JSON it broke.
-func (v *Vault) Mask(body []byte) ([]byte, error) {
+func (v *Vault) Mask(body []byte) ([]byte, error) { return v.maskBody(body, nil) }
+
+// MaskTrace is Mask that also reports what it replaced.
+func (v *Vault) MaskTrace(body []byte) ([]byte, []Rewrite, error) {
+	var trace []Rewrite
+	out, err := v.maskBody(body, &trace)
+	return out, trace, err
+}
+
+func (v *Vault) maskBody(body []byte, trace *[]Rewrite) ([]byte, error) {
 	v.mu.RLock()
-	r := v.mask
+	r, es := v.mask, v.entries
 	v.mu.RUnlock()
 	out := []byte(r.Replace(string(body)))
 	if json.Valid(body) && !json.Valid(out) {
 		return nil, errors.New("masking produced invalid JSON (a secret matched outside a JSON string?)")
 	}
+	if trace != nil {
+		for _, e := range es {
+			if n := bytes.Count(body, []byte(jsonEscape(e.Value))); n > 0 {
+				*trace = append(*trace, Rewrite{"secret", e.Name, e.Value, e.Token, e.Source, n})
+			}
+		}
+	}
 	// Renames go after secrets, so a rename can never alter a secret before it is masked.
-	if renamed, err := v.renameJSON(out, false); err == nil {
+	if renamed, err := v.renameJSON(out, false, true, trace); err == nil {
 		out = renamed
 	}
 	return out, nil
@@ -120,37 +149,173 @@ func (v *Vault) Mask(body []byte) ([]byte, error) {
 
 // UnmaskInput restores a tool input (JSON text): renames first, then secrets,
 // the reverse of Mask, so a secret token containing a renamed word still resolves.
-func (v *Vault) UnmaskInput(js string) string {
-	if b, err := v.renameJSON([]byte(js), true); err == nil {
+func (v *Vault) UnmaskInput(js string) string { return v.unmaskInput(js, true, nil) }
+
+// UnmaskToolInput restores the input of the named tool. Tools that reach the
+// network keep cloaked hosts' localhost addresses (see keepsLocalAddress). A
+// non-nil trace gets what was restored.
+func (v *Vault) UnmaskToolInput(tool, js string, trace *[]Rewrite) string {
+	return v.unmaskInput(js, !keepsLocalAddress(tool), trace)
+}
+
+// AddHost shows h's real address to the model as its localhost one.
+func (v *Vault) AddHost(h *Host) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.hosts = append(v.hosts, newHostMask(h))
+	// Longest first, so api.acme.com is masked as itself before acme.com can hit it.
+	slices.SortStableFunc(v.hosts, func(a, b hostMask) int {
+		return len(b.host.Target.Hostname()) - len(a.host.Target.Hostname())
+	})
+}
+
+// UnmaskText restores stand-ins in plain text, such as a reply the user reads.
+func (v *Vault) UnmaskText(s string) string { return v.unmaskText(s, nil) }
+
+// UnmaskTextTrace is UnmaskText that also reports what it restored.
+func (v *Vault) UnmaskTextTrace(s string) (string, []Rewrite) {
+	var trace []Rewrite
+	return v.unmaskText(s, &trace), trace
+}
+
+func (v *Vault) unmaskText(s string, trace *[]Rewrite) string {
+	var out string
+	if json.Unmarshal([]byte(v.unmaskInput(`"`+jsonEscape(s)+`"`, true, trace)), &out) != nil {
+		return s
+	}
+	return out
+}
+
+func (v *Vault) unmaskInput(js string, hosts bool, trace *[]Rewrite) string {
+	if b, err := v.renameJSON([]byte(js), true, hosts, trace); err == nil {
 		js = string(b)
+	}
+	if trace != nil {
+		for _, e := range v.Entries() {
+			if n := strings.Count(js, e.Token); n > 0 {
+				*trace = append(*trace, Rewrite{"secret", e.Name, e.Value, e.Token, e.Source, n})
+			}
+		}
 	}
 	return v.UnmaskJSON(js)
 }
 
-// AddRename makes the agent see to wherever from appears as a whole word.
+// rename is one [names] rule, or its reverse.
+type rename struct{ from, to string }
+
+// AddRename makes the agent see to wherever from appears as a whole word, in any
+// case; the replacement takes the casing of the text it replaces (see matchCase).
 func (v *Vault) AddRename(from, to string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.renames == nil {
-		v.renames, v.unrenames = map[string]string{}, map[string]string{}
+		v.renames, v.unrenames = map[string]rename{}, map[string]rename{}
 	}
-	v.renames[from], v.unrenames[to] = to, from
+	v.renames[strings.ToLower(from)] = rename{from, to}
+	v.unrenames[strings.ToLower(to)] = rename{to, from}
 	v.renameRe, v.unrenameRe = wordRe(v.renames), wordRe(v.unrenames)
 }
 
+// Renames returns each rule as written in the config: real word -> word the agent sees.
 func (v *Vault) Renames() map[string]string {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return maps.Clone(v.renames)
+	out := map[string]string{}
+	for _, r := range v.renames {
+		out[r.from] = r.to
+	}
+	return out
+}
+
+// lookup finds the rule for a word the (?i) regexp matched. Go's case folding
+// also matches a few letters strings.ToLower doesn't map (the Kelvin sign K).
+func lookup(m map[string]rename, w string) (rename, bool) {
+	if r, ok := m[strings.ToLower(w)]; ok {
+		return r, true
+	}
+	for _, r := range m {
+		if strings.EqualFold(r.from, w) {
+			return r, true
+		}
+	}
+	return rename{}, false
+}
+
+// matchCase returns to in the casing of match, which equals from ignoring case:
+//
+//	exactly like from                    ->  to as written
+//	banana / BANANA                      ->  apple / APPLE
+//	only the first letter's case differs ->  that letter changes too: CalculateRiskScore -> ScoreThing
+//	Banana (one capital, first)          ->  Apple
+//	anything else                        ->  letter by letter: SoMe -> ToBe; extra letters
+//	                                         in to follow the last letter of match
+//
+// Mixed case only round-trips exactly when from and to have the same length.
+func matchCase(match, from, to string) string {
+	if match == from {
+		return to
+	}
+	var upper []bool // the case of each letter in match that has one
+	uppers := 0
+	for _, r := range match {
+		if unicode.IsUpper(r) {
+			upper = append(upper, true)
+			uppers++
+		} else if unicode.IsLower(r) {
+			upper = append(upper, false)
+		}
+	}
+	m, f := []rune(match), []rune(from)
+	switch {
+	case len(upper) == 0:
+		return to
+	case uppers == 0:
+		return strings.ToLower(to)
+	case uppers == len(upper) && len(upper) > 1:
+		return strings.ToUpper(to)
+	case len(m) == len(f) && string(m[1:]) == string(f[1:]):
+		return withFirst(to, unicode.IsUpper(m[0]))
+	case upper[0] && uppers == 1:
+		return withFirst(to, true)
+	}
+	var out strings.Builder
+	j := 0
+	for _, r := range to {
+		if unicode.IsLetter(r) {
+			if upper[min(j, len(upper)-1)] {
+				r = unicode.ToUpper(r)
+			} else {
+				r = unicode.ToLower(r)
+			}
+			j++
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
+}
+
+// withFirst returns s with its first letter in upper or lower case.
+func withFirst(s string, upper bool) string {
+	for i, r := range s {
+		if unicode.IsLetter(r) {
+			c := unicode.ToLower(r)
+			if upper {
+				c = unicode.ToUpper(r)
+			}
+			return s[:i] + string(c) + s[i+utf8.RuneLen(r):]
+		}
+	}
+	return s
 }
 
 func isWordByte(c byte) bool {
 	return c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
-// wordRe matches any key of m as a whole word: an end that is an identifier
-// character must not run into another one, so "key" skips "keyboard" and "VALID_KEY".
-func wordRe(m map[string]string) *regexp.Regexp {
+// wordRe matches any key of m as a whole word, in any case: an end that is an
+// identifier character must not run into another one, so "key" skips "keyboard"
+// and "VALID_KEY".
+func wordRe(m map[string]rename) *regexp.Regexp {
 	words := slices.Collect(maps.Keys(m))
 	slices.SortFunc(words, func(a, b string) int { return len(b) - len(a) }) // leftmost-first: longest wins
 	for i, w := range words {
@@ -163,19 +328,26 @@ func wordRe(m map[string]string) *regexp.Regexp {
 		}
 		words[i] = q
 	}
-	return regexp.MustCompile(strings.Join(words, "|"))
+	return regexp.MustCompile(`(?i)` + strings.Join(words, "|"))
 }
 
 // renameJSON applies renames (or their reverse) to every string value in a JSON
 // document. Keys stay put, and so do thinking blocks, whose signature covers their text.
-func (v *Vault) renameJSON(body []byte, inverse bool) ([]byte, error) {
+// A non-nil trace gets one Rewrite per word and casing replaced.
+//
+// Cloaked hosts (when hosts is set) go before renames on the way out and after
+// them on the way back, so a rename can't alter a host name before it is masked.
+func (v *Vault) renameJSON(body []byte, inverse, hosts bool, trace *[]Rewrite) ([]byte, error) {
 	v.mu.RLock()
-	re, m := v.renameRe, v.renames
+	re, m, hm := v.renameRe, v.renames, v.hosts
 	if inverse {
 		re, m = v.unrenameRe, v.unrenames
 	}
 	v.mu.RUnlock()
-	if re == nil {
+	if !hosts {
+		hm = nil
+	}
+	if re == nil && len(hm) == 0 {
 		return body, nil
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -184,11 +356,49 @@ func (v *Vault) renameJSON(body []byte, inverse bool) ([]byte, error) {
 	if err := dec.Decode(&doc); err != nil {
 		return nil, err
 	}
+	type pair struct{ kind, name, from, to string }
+	var counts map[pair]int
+	if trace != nil {
+		counts = map[pair]int{}
+	}
+	cloak := func(s string) string {
+		for _, h := range hm {
+			var count func(from, to string)
+			if counts != nil {
+				count = func(from, to string) { counts[pair{"host", h.host.Target.String(), from, to}]++ }
+			}
+			s = h.apply(s, inverse, count)
+		}
+		return s
+	}
 	var walk func(any) any
 	walk = func(x any) any {
 		switch t := x.(type) {
 		case string:
-			return re.ReplaceAllStringFunc(t, func(w string) string { return m[w] })
+			if !inverse {
+				t = cloak(t)
+			}
+			if re != nil {
+				t = re.ReplaceAllStringFunc(t, func(w string) string {
+					r, ok := lookup(m, w)
+					if !ok {
+						return w
+					}
+					out := matchCase(w, r.from, r.to)
+					if counts != nil {
+						name := r.from // the [names] word as written in the config
+						if inverse {
+							name = r.to
+						}
+						counts[pair{"rename", name, w, out}]++
+					}
+					return out
+				})
+			}
+			if inverse {
+				t = cloak(t)
+			}
+			return t
 		case []any:
 			for i := range t {
 				t[i] = walk(t[i])
@@ -208,6 +418,13 @@ func (v *Vault) renameJSON(body []byte, inverse bool) ([]byte, error) {
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(walk(doc)); err != nil {
 		return nil, err
+	}
+	for p, n := range counts {
+		real, shown := p.from, p.to
+		if inverse {
+			real, shown = p.to, p.from
+		}
+		*trace = append(*trace, Rewrite{Kind: p.kind, Name: p.name, Real: real, Shown: shown, Count: n})
 	}
 	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
 }
